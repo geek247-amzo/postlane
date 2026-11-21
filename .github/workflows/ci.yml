@@ -1,0 +1,90 @@
+name: Validate
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        database: [sqlite, postgres]
+    services:
+      postgres:
+        image: postgres:17.11-bookworm
+        env:
+          POSTGRES_USER: postlane
+          POSTGRES_PASSWORD: disposable-ci-password
+          POSTGRES_DB: postlane_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postlane -d postlane_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r backend/requirements.lock
+      - name: Test isolated database
+        env:
+          DATABASE_KIND: ${{ matrix.database }}
+        run: |
+          if [ "$DATABASE_KIND" = postgres ]; then
+            export POSTLANE_TEST_DATABASE_URL='postgresql+psycopg://postlane:disposable-ci-password@127.0.0.1:5432/postlane_test'
+          fi
+          python -m pytest -q
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Validate Compose configuration
+        run: |
+          python3 scripts/configure.py --host inbox.example.com --mail-host mail.example.com
+          docker compose config --quiet
+      - run: docker build -t postlane:ci -t postlane:0.3.0 .
+      - name: Verify hardened image boot and sample API
+        run: |
+          docker run -d --name postlane-ci --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp --mount type=volume,dst=/app/data -p 127.0.0.1:8000:8000 -e APP_ENV=development -e DEMO_MODE=true -e APP_URL=http://127.0.0.1:8000 postlane:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/ready > /dev/null; then break; fi
+            sleep 2
+          done
+          python3 scripts/smoke.py
+          test "$(docker exec postlane-ci id -u)" = 10001
+      - name: Verify production app, worker and database startup
+        run: |
+          docker compose up -d --no-build app worker
+          for attempt in $(seq 1 30); do
+            if docker compose exec -T worker python -m backend.runtime; then break; fi
+            sleep 2
+          done
+          docker compose exec -T worker python -m backend.runtime
+          docker compose exec -T app python -c "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=5).status == 200"
+          docker compose exec -T app python -c "from backend import config; assert config.PRODUCTION and not config.DEMO; assert config.DATABASE_URL.startswith('postgresql'); assert config.ENCRYPTION_KEY and config.BOOTSTRAP_TOKEN"
+          docker compose stop app worker
+          docker compose up -d --no-build app worker
+          docker compose exec -T app python -c "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=5).status == 200"
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs postlane-ci 2>/dev/null || true
+  codex-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build isolated Codex bridge
+        run: docker build -f codex_bridge/Dockerfile -t postlane-codex:ci .
+      - name: Validate optional Compose configuration
+        run: |
+          python3 scripts/configure.py --host inbox.example.com --mail-host mail.example.com
+          python3 scripts/enable_codex.py
+          docker compose -f compose.yaml -f deploy/compose.codex.yaml config --quiet
+      - name: Verify unauthenticated Codex protocol and isolation
+        run: |
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp --mount type=volume,dst=/accounts postlane-codex:ci python smoke.py

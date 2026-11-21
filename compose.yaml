@@ -1,0 +1,178 @@
+name: ${COMPOSE_PROJECT_NAME:-postlane}
+
+x-app-environment: &app-environment
+  APP_ENV: production
+  DEMO_MODE: "false"
+  APP_URL: https://${APP_HOST:?Set APP_HOST}
+  DATABASE_HOST: db
+  DATABASE_PASSWORD_FILE: /run/secrets/database_password
+  ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+  BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap_token
+  MAIL_ALLOWED_HOSTS: ${MAIL_ALLOWED_HOSTS:-}
+  MAIL_HOST: ${MAIL_HOST:-}
+  WEBHOOK_ALLOWED_ORIGINS: ${WEBHOOK_ALLOWED_ORIGINS:-}
+  WEBHOOK_PRIVATE_ORIGINS: ${WEBHOOK_PRIVATE_ORIGINS:-}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+  MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+  AI_BASE_URL: ${AI_BASE_URL:-}
+  AI_API_KEY: ${AI_API_KEY:-}
+  AI_MODEL: ${AI_MODEL:-}
+  STALWART_API_URL: ${STALWART_API_URL:-}
+  STALWART_API_TOKEN: ${STALWART_API_TOKEN:-}
+  MAILCOW_API_URL: ${MAILCOW_API_URL:-}
+  MAILCOW_API_KEY_FILE: /run/secrets/mailcow_api_key
+  MAIL_SPF_VALUE: ${MAIL_SPF_VALUE:-}
+  PUSH_VAPID_PUBLIC_KEY: ${PUSH_VAPID_PUBLIC_KEY:-}
+  PUSH_VAPID_SUBJECT: ${PUSH_VAPID_SUBJECT:-}
+  PUSH_VAPID_PRIVATE_KEY_FILE: /run/secrets/push_vapid_private_key
+
+services:
+  app:
+    image: postlane:0.3.0
+    build: .
+    restart: unless-stopped
+    environment: *app-environment
+    secrets: [database_password, encryption_key, bootstrap_token, mailcow_api_key, push_vapid_private_key]
+    init: true
+    pids_limit: 128
+    stop_grace_period: 45s
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend, egress]
+    volumes: [app-data:/app/data]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=3)",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  worker:
+    image: postlane:0.3.0
+    restart: unless-stopped
+    command: [python, -m, backend.worker]
+    environment: *app-environment
+    secrets: [database_password, encryption_key, bootstrap_token, mailcow_api_key, push_vapid_private_key]
+    init: true
+    pids_limit: 128
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD, python, -m, backend.runtime]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [backend, egress]
+    volumes: [app-data:/app/data]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  db:
+    image: postgres:17.11-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postlane
+      POSTGRES_USER: postlane
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    secrets: [database_password]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postlane -d postlane"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  gateway:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    environment:
+      APP_HOST: ${APP_HOST:?Set APP_HOST}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [backend, egress]
+    depends_on:
+      app:
+        condition: service_healthy
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16.22
+    restart: unless-stopped
+    profiles: [mail]
+    environment:
+      STALWART_PUBLIC_URL: https://${MAIL_HOST:?Set MAIL_HOST}
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8443:443"
+    volumes:
+      - stalwart-config:/etc/stalwart
+      - stalwart-data:/var/lib/stalwart
+    networks:
+      egress:
+        aliases: ["${MAIL_HOST:?Set MAIL_HOST}"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+secrets:
+  database_password:
+    file: ./secrets/database_password
+  encryption_key:
+    file: ./secrets/encryption_key
+  bootstrap_token:
+    file: ./secrets/bootstrap_token
+  mailcow_api_key:
+    file: ./secrets/mailcow_api_key
+  push_vapid_private_key:
+    file: ./secrets/push_vapid_private_key
+
+networks:
+  backend:
+    internal: true
+  egress: {}
+
+volumes:
+  app-data: {}
+  postgres-data: {}
+  caddy-data: {}
+  caddy-config: {}
+  stalwart-config: {}
+  stalwart-data: {}
