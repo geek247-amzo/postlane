@@ -2,7 +2,7 @@
 
 **Open-source email workspace · Self-hosted · Human-controlled AI assistance**
 
-[Documentation](docs/README.md) · [Developer/agent setup](docs/agent-setup.md) · [Security](SECURITY.md) · [Deployment acceptance](docs/release-checklist.md) · [Changelog](CHANGELOG.md)
+[Documentation](docs/README.md) · [Developer/agent setup](docs/agent-setup.md) · [Security](SECURITY.md) · [Deployment acceptance](docs/release-checklist.md) · [Changelog](CHANGELOG.md) · [HumbleMind project page](https://humblemindai.com/open-source/postlane)
 
 Postlane is a self-hosted email workspace for people and teams. Run it on infrastructure you control and configure your own mail providers, credentials, retention, backups and access policies.
 
